@@ -24,6 +24,15 @@ Run the standalone mock server example:
 cargo run --example test_server
 ```
 
+## Security & Compliance
+
+- **BPSec (RFC 9172)**: Strict signature verification by default; rejection of unsigned file bundles and missing keys under `VerifyPolicy::Strict`.
+- **Pre-Quota RAM Protection**: Early stream rejection before buffering if `total_len` exceeds remaining storage quota.
+- **Filesystem Hardening**: Strict filename sanitization (128 chars, `[A-Za-z0-9_-]`), non-blocking async disk writes (`tokio::fs::write`), and automatic cleanup of orphan files when DB insertion fails.
+- **Cyber Resilience Act (CRA)**: Token file security (`--token-file`), lifetime calculation clamping, VEX audit documentation (`RUSTSEC-2026-0459`), and SHA-pinned CI actions.
+- **Rust Quality Standards**: 100% `unwrap`-free and `panic!`-free production codebase.
+- **Documentation**: See [`AGENTS.md`](AGENTS.md), [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), and Architectural Decision Records in [`adr/`](adr/).
+
 ## License
 
 Dual-licensed under the Apache License, Version 2.0 or the MIT License (crate metadata: `Apache-2.0`). See [LICENSE.md](LICENSE.md).
