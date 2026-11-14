@@ -479,7 +479,7 @@ async fn test_files_payload_range_requests_and_mime_detection() {
     let body_bytes = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
     assert_eq!(&body_bytes[..], b"ftyp");
 
-    // 8. SVG full download
+    // 8. SVG full download (must force attachment disposition + sandbox CSP to prevent stored SVG XSS)
     let res = srv.get("/api/files/v1/test_svg_bundle/payload").await;
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
@@ -492,7 +492,7 @@ async fn test_files_payload_range_requests_and_mime_detection() {
             .unwrap()
             .to_str()
             .unwrap(),
-        "inline; filename=\"test_image.svg\""
+        "attachment; filename=\"test_image.svg\""
     );
 }
 

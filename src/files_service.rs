@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 use dtnpm_core::internal_storage::{FileBundleRecord, InternalStorage};
 use dtnpm_core::security::{AuthStatus, DirectionalKeyStore, VerifyPolicy, verify_parsed_bundle};
 use dtnpm_core::service_tracker::ServiceTracker;
+use sha2::{Digest, Sha256};
 
 /// Permanent DTN BPv7 service for file transfers and bundle inspection (`BUNDLE_LIST`).
 #[derive(Clone)]
@@ -53,9 +54,10 @@ impl FilesService {
 
         let auth_status = verify_parsed_bundle(&parsed, &self.keystore);
         let policy = self.keystore.get_policy();
-        if policy == VerifyPolicy::Strict && auth_status == AuthStatus::Invalid {
+        if policy == VerifyPolicy::Strict && auth_status != AuthStatus::Valid {
             warn!(
-                "FilesService: dropping delivered bundle due to strict policy and invalid signature"
+                auth_status = ?auth_status,
+                "FilesService: dropping delivered bundle due to strict policy without valid BPSec signature"
             );
             return Ok(());
         }
@@ -93,8 +95,9 @@ impl FilesService {
             .unwrap_or_else(|_| dt.to_string());
 
         let creation_timestamp = (dt.unix_timestamp_nanos() / 1_000_000) as i64;
-        let lifetime_secs = bundle.primary.lifetime.as_secs();
-        let expiry_timestamp = creation_timestamp + (lifetime_secs as i64 * 1000);
+        let lifetime_secs = bundle.primary.lifetime.as_secs().min(365 * 86_400);
+        let expiry_timestamp =
+            creation_timestamp.saturating_add((lifetime_secs as i64).saturating_mul(1000));
 
         let (inferred_mime, _) = dtnpm_core::bundle_inspector::infer_mime_type(payload_slice);
         let mime_type = inferred_mime.to_string();
@@ -137,18 +140,7 @@ impl FilesService {
             _ => "bin",
         };
 
-        // Sanitize bundle id for filename
-        let safe_name: String = bundle_id
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-
+        let safe_name = sanitize_bundle_filename(&bundle_id);
         let filename = format!("{safe_name}.{ext}");
         let payload_path = self.storage.files_dir().join(&filename);
 
@@ -161,8 +153,8 @@ impl FilesService {
             return Ok(());
         }
 
-        // Save payload file to disk with graceful error handling (disk full / permission denied)
-        if let Err(e) = std::fs::write(&payload_path, payload_slice) {
+        // Save payload file to disk without blocking the async runtime
+        if let Err(e) = tokio::fs::write(&payload_path, payload_slice).await {
             error!(
                 "FilesService: failed to write payload file to {}: {}",
                 payload_path.display(),
@@ -192,6 +184,13 @@ impl FilesService {
                 "FilesService: failed to insert bundle record {}: {}",
                 bundle_id, e
             );
+            if let Err(rm_err) = tokio::fs::remove_file(&payload_path).await {
+                warn!(
+                    "FilesService: failed to clean up orphan file {} after DB insert failure: {}",
+                    payload_path.display(),
+                    rm_err
+                );
+            }
         } else {
             info!(
                 "Stored new file bundle from {} (id: {}, bytes: {})",
@@ -236,7 +235,300 @@ impl Service for FilesService {
         stream: &mut dyn Receiver<Segment>,
     ) -> ServiceResult<()> {
         debug!("FilesService on_deliver called for bundle_id={bundle_id:?}, len={total_len}");
+        let max_bytes = self.storage.max_storage_bytes();
+        if total_len > max_bytes {
+            warn!(
+                bundle_id = ?bundle_id,
+                total_len,
+                max_storage_bytes = max_bytes,
+                "FilesService: dropping incoming bundle before buffering because total_len exceeds storage quota"
+            );
+            return Ok(());
+        }
         let data = buffer_stream(stream, total_len).await?;
         self.handle_delivered_bundle(data).await
+    }
+}
+
+/// Sanitizes a bundle ID into a bounded ASCII filename stem (`<= 96` characters)
+/// combining up to 79 safe ASCII characters with a 16-hex-char SHA-256 prefix
+/// to prevent `ENAMETOOLONG` and path traversal while remaining collision-resistant.
+fn sanitize_bundle_filename(bundle_id: &str) -> String {
+    let digest = Sha256::digest(bundle_id.as_bytes());
+    let mut hash_hex = String::with_capacity(16);
+    for byte in &digest[..8] {
+        use std::fmt::Write as _;
+        let _ = write!(hash_hex, "{byte:02x}");
+    }
+
+    let prefix: String = bundle_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(79)
+        .collect();
+
+    if prefix.is_empty() {
+        hash_hex
+    } else {
+        format!("{prefix}_{hash_hex}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dtnpm_core::MockBpa;
+    use dtnpm_core::security::{Direction, KeyEntry, sign_bundle_with_key};
+    use hardy_bpa::stream::RecvError;
+    use hardy_bpv7::builder::Builder;
+    use hardy_bpv7::creation_timestamp::CreationTimestamp;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    fn make_files_service(
+        keystore: Arc<DirectionalKeyStore>,
+        max_quota: Option<u64>,
+    ) -> (FilesService, InternalStorage, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = match max_quota {
+            Some(q) => InternalStorage::new_disk_with_quota(tmp.path(), q).unwrap(),
+            None => InternalStorage::new_disk(tmp.path()).unwrap(),
+        };
+        let bpa = Arc::new(MockBpa::new("dtn://stata/"));
+        let tracker = ServiceTracker::new(bpa);
+        (
+            FilesService::new(storage.clone(), tracker, keystore),
+            storage,
+            tmp,
+        )
+    }
+
+    fn build_file_bundle(src: &str, dst: &str, payload: &[u8], lifetime_secs: u64) -> Vec<u8> {
+        let src_eid: Eid = src.parse().unwrap();
+        let dst_eid: Eid = dst.parse().unwrap();
+        let (_bundle, raw) = Builder::new(src_eid, dst_eid)
+            .with_lifetime(Duration::from_secs(lifetime_secs))
+            .with_payload(payload.to_vec().into())
+            .build(CreationTimestamp::now())
+            .unwrap();
+        raw.into_vec()
+    }
+
+    #[tokio::test]
+    async fn strict_policy_rejects_unsigned_missing_key_and_invalid_accepts_valid() {
+        let keystore = Arc::new(DirectionalKeyStore::empty());
+        keystore.set_policy(VerifyPolicy::Strict).unwrap();
+        let valid_secret = b"files_inbound_secret_key_32_byte".to_vec();
+        keystore
+            .add_key(
+                Direction::Inbound,
+                "dtn://f4jxq/*".to_string(),
+                valid_secret.clone(),
+                None,
+            )
+            .unwrap();
+
+        let (service, storage, _tmp) = make_files_service(keystore, None);
+
+        // 1. Unsigned bundle must be dropped
+        let unsigned = build_file_bundle("dtn://f4jxq/files", "dtn://stata/files", b"hello", 3600);
+        service
+            .handle_delivered_bundle(Bytes::from(unsigned.clone()))
+            .await
+            .unwrap();
+        assert!(storage.list_file_bundles().unwrap().is_empty());
+
+        // 2. MissingKey bundle must be dropped
+        let unknown_raw =
+            build_file_bundle("dtn://unknown/files", "dtn://stata/files", b"unknown", 3600);
+        let unknown_parsed = parse(Bytes::from(unknown_raw.clone())).unwrap();
+        let unknown_key = KeyEntry {
+            id: "u1".into(),
+            direction: Direction::Outbound,
+            pattern: "dtn://stata/*".into(),
+            label: None,
+            secret: b"other_secret_key_32_bytes_123456".to_vec(),
+            created_at: "now".into(),
+        };
+        let missing_signed =
+            sign_bundle_with_key(&unknown_parsed.bundle, &unknown_raw, &unknown_key, None).unwrap();
+        service
+            .handle_delivered_bundle(Bytes::from(missing_signed))
+            .await
+            .unwrap();
+        assert!(storage.list_file_bundles().unwrap().is_empty());
+
+        // 3. Wrong secret (Invalid) must be dropped
+        let parsed = parse(Bytes::from(unsigned.clone())).unwrap();
+        let wrong_key = KeyEntry {
+            id: "bad".into(),
+            direction: Direction::Outbound,
+            pattern: "dtn://stata/*".into(),
+            label: None,
+            secret: b"wrong_secret_key_32_bytes_123456".to_vec(),
+            created_at: "now".into(),
+        };
+        let invalid_signed =
+            sign_bundle_with_key(&parsed.bundle, &unsigned, &wrong_key, None).unwrap();
+        service
+            .handle_delivered_bundle(Bytes::from(invalid_signed))
+            .await
+            .unwrap();
+        assert!(storage.list_file_bundles().unwrap().is_empty());
+
+        // 4. Valid signature must be accepted
+        let good_key = KeyEntry {
+            id: "good".into(),
+            direction: Direction::Outbound,
+            pattern: "dtn://stata/*".into(),
+            label: None,
+            secret: valid_secret,
+            created_at: "now".into(),
+        };
+        let valid_signed =
+            sign_bundle_with_key(&parsed.bundle, &unsigned, &good_key, None).unwrap();
+        service
+            .handle_delivered_bundle(Bytes::from(valid_signed))
+            .await
+            .unwrap();
+        assert_eq!(storage.list_file_bundles().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn warn_and_ignore_policies_accept_unsigned_bundles() {
+        for policy in [VerifyPolicy::Warn, VerifyPolicy::Ignore] {
+            let keystore = Arc::new(DirectionalKeyStore::empty());
+            keystore.set_policy(policy).unwrap();
+            let (service, storage, _tmp) = make_files_service(keystore, None);
+            let unsigned =
+                build_file_bundle("dtn://f4jxq/files", "dtn://stata/files", b"opt-in", 3600);
+            service
+                .handle_delivered_bundle(Bytes::from(unsigned))
+                .await
+                .unwrap();
+            assert_eq!(
+                storage.list_file_bundles().unwrap().len(),
+                1,
+                "policy {policy:?} should accept unsigned"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn huge_bundle_lifetime_is_clamped_without_overflow() {
+        let keystore = Arc::new(DirectionalKeyStore::empty());
+        keystore.set_policy(VerifyPolicy::Warn).unwrap();
+        let (service, storage, _tmp) = make_files_service(keystore, None);
+        let raw = build_file_bundle(
+            "dtn://f4jxq/files",
+            "dtn://stata/files",
+            b"clamped",
+            u64::MAX / 1000,
+        );
+        service
+            .handle_delivered_bundle(Bytes::from(raw))
+            .await
+            .unwrap();
+        let files = storage.list_file_bundles().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].lifetime_secs, 365 * 86_400);
+        assert_eq!(
+            files[0].expiry_timestamp - files[0].creation_timestamp,
+            365 * 86_400 * 1000
+        );
+    }
+
+    struct TrackingRejectStream {
+        recv_called: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Receiver<Segment> for TrackingRejectStream {
+        async fn recv(&mut self) -> core::result::Result<Segment, RecvError> {
+            self.recv_called.store(true, Ordering::SeqCst);
+            Err(RecvError)
+        }
+    }
+
+    #[tokio::test]
+    async fn on_deliver_rejects_oversized_bundle_before_buffering_stream() {
+        let keystore = Arc::new(DirectionalKeyStore::empty());
+        let (service, _storage, _tmp) = make_files_service(keystore, Some(1024));
+        let recv_called = Arc::new(AtomicBool::new(false));
+        let mut stream = TrackingRejectStream {
+            recv_called: recv_called.clone(),
+        };
+        let raw = build_file_bundle("dtn://f4jxq/files", "dtn://stata/files", b"small", 3600);
+        let parsed = parse(Bytes::from(raw)).unwrap();
+
+        service
+            .on_deliver(
+                &parsed.bundle.primary.id,
+                OffsetDateTime::now_utc(),
+                2048,
+                &mut stream,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !recv_called.load(Ordering::SeqCst),
+            "buffer_stream must not pull segments when total_len > max_storage_bytes"
+        );
+    }
+
+    #[test]
+    fn sanitize_bundle_filename_bounds_length_and_avoids_traversal() {
+        let long_a = format!("{}alpha", "a".repeat(250));
+        let long_b = format!("{}bravo", "a".repeat(250));
+        let safe_a = sanitize_bundle_filename(&long_a);
+        let safe_b = sanitize_bundle_filename(&long_b);
+        assert!(safe_a.len() <= 96);
+        assert!(safe_b.len() <= 96);
+        assert_ne!(safe_a, safe_b);
+        assert!(
+            safe_a
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        );
+
+        let traversal = sanitize_bundle_filename("../../etc/passwd\0foo");
+        assert!(!traversal.contains('.'));
+        assert!(!traversal.contains('/'));
+        assert!(!traversal.contains('\\'));
+        assert!(!traversal.contains('\0'));
+    }
+
+    #[tokio::test]
+    async fn orphan_file_removed_when_db_insert_fails() {
+        let keystore = Arc::new(DirectionalKeyStore::empty());
+        let (service, storage, _tmp) = make_files_service(keystore, None);
+        {
+            let conn_arc = storage.connection();
+            let conn = conn_arc.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_file_insert BEFORE INSERT ON files_bundles \
+                 BEGIN SELECT RAISE(ABORT, 'simulated db error'); END;",
+            )
+            .unwrap();
+        }
+
+        let raw = build_file_bundle("dtn://f4jxq/files", "dtn://stata/files", b"orphan", 3600);
+        service
+            .handle_delivered_bundle(Bytes::from(raw))
+            .await
+            .unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(storage.files_dir()).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "payload file must be removed when DB insert fails"
+        );
     }
 }
