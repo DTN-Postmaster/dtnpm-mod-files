@@ -2,6 +2,10 @@
 
 Fullstack **DTN File Transfer** plugin for **DTN Postmaster** (`dtnpm`), implementing `dtnpm_web_core::WebModule`.
 
+## Screenshot
+
+![DTN File Bundles UI](docs/screenshots/files.png)
+
 ## Features
 
 - **BPA Service (`FilesService`)**: Registers `dtn://<node>/files`, persists incoming file bundles with BPsec auth metadata, and broadcasts real-time SSE notifications.
