@@ -1,22 +1,22 @@
-# Guide de Contribution — `dtnpm-mod-files`
+# Contributing Guide — `dtnpm-mod-files`
 
-Ce guide présente les règles de développement et les exigences de sécurité pour le module de transfert de fichiers de `dtnpm-mod-files`.
-
----
-
-## 1. Principes Fondamentaux
-
-- **Zéro Panic / Zéro Unwrap** : Aucun appel `.unwrap()` ou `.expect()` en code de production.
-- **Sécurité du Stockage & Quotas** :
-  - Toujours vérifier la taille du bundle avant de le charger en mémoire.
-  - Toujours assainir le nom de fichier et borner sa longueur.
-  - Toujours nettoyer le fichier sur disque si la transaction SQLite échoue.
-- **Traçabilité Architecturale (ADR)** :
-  - Tout changement dans la gestion du stockage ou de l'API doit faire l'objet d'un fichier ADR sous `adr/` et être indexé dans `adr/README.md`.
+This guide outlines the development rules and security requirements for the `dtnpm-mod-files` file transfer module.
 
 ---
 
-## 2. Vérification Locale
+## 1. Core Principles
+
+- **Zero Panic / Zero Unwrap**: No `.unwrap()` or `.expect()` calls in production code.
+- **Storage & Quota Security**:
+  - Always check the bundle size before buffering it into memory.
+  - Always sanitize the filename and bound its length.
+  - Always clean up the file on disk if the SQLite transaction fails.
+- **Architectural Traceability (ADR)**:
+  - Any change to storage management or the API must be documented in an ADR file under `adr/` and indexed in `adr/README.md`.
+
+---
+
+## 2. Local Verification
 
 ```bash
 cargo fmt --all -- --check
