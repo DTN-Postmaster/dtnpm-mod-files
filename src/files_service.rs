@@ -16,7 +16,7 @@ use time::OffsetDateTime;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info, warn};
 
-use dtnpm_core::internal_storage::{FileBundleRecord, InternalStorage};
+use dtnpm_core::internal_storage::{FileBundleRecord, InternalStorage, status_notify_to_parts};
 use dtnpm_core::security::{AuthStatus, DirectionalKeyStore, VerifyPolicy, verify_parsed_bundle};
 use dtnpm_core::service_tracker::ServiceTracker;
 use sha2::{Digest, Sha256};
@@ -228,20 +228,7 @@ impl Service for FilesService {
         reason: ReasonCode,
         timestamp: Option<OffsetDateTime>,
     ) {
-        let status_str = match kind {
-            StatusNotify::Received => "received",
-            StatusNotify::Forwarded => "forwarded",
-            StatusNotify::Delivered => "delivered",
-            StatusNotify::Deleted => "deleted",
-        };
-        let reason_u64 = u64::from(reason);
-        let ts_ms = i64::try_from(
-            timestamp
-                .unwrap_or_else(OffsetDateTime::now_utc)
-                .unix_timestamp_nanos()
-                / 1_000_000,
-        )
-        .unwrap_or(0);
+        let (status_str, reason_u64, ts_ms) = status_notify_to_parts(kind, reason, timestamp);
         let key = bundle_id.to_key();
 
         match self
