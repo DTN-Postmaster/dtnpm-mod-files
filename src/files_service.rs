@@ -177,6 +177,9 @@ impl FilesService {
             is_read: false,
             created_at,
             auth_status: auth_status.as_str().to_string(),
+            delivery_status: None,
+            delivery_reason: None,
+            delivery_updated_at: None,
         };
 
         if let Err(e) = self.storage.insert_file_bundle(&record) {
@@ -219,12 +222,53 @@ impl Service for FilesService {
 
     async fn on_status_notify(
         &self,
-        _bundle_id: &Id,
-        _from: &Eid,
-        _kind: StatusNotify,
-        _reason: ReasonCode,
-        _timestamp: Option<OffsetDateTime>,
+        bundle_id: &Id,
+        from: &Eid,
+        kind: StatusNotify,
+        reason: ReasonCode,
+        timestamp: Option<OffsetDateTime>,
     ) {
+        let status_str = match kind {
+            StatusNotify::Received => "received",
+            StatusNotify::Forwarded => "forwarded",
+            StatusNotify::Delivered => "delivered",
+            StatusNotify::Deleted => "deleted",
+        };
+        let reason_u64 = u64::from(reason);
+        let ts_ms = i64::try_from(
+            timestamp
+                .unwrap_or_else(OffsetDateTime::now_utc)
+                .unix_timestamp_nanos()
+                / 1_000_000,
+        )
+        .unwrap_or(0);
+        let key = bundle_id.to_key();
+
+        match self
+            .storage
+            .update_file_delivery_status(&key, status_str, reason_u64, ts_ms)
+        {
+            Ok(true) => {
+                debug!(
+                    bundle_id = %key,
+                    from = %from,
+                    delivery_status = status_str,
+                    reason = reason_u64,
+                    "Updated file bundle delivery receipt"
+                );
+                self.service_tracker.broadcast_bundles_update();
+            }
+            Ok(false) => debug!(
+                bundle_id = %key,
+                delivery_status = status_str,
+                "Ignored file status notification (unknown bundle or non-progressive status)"
+            ),
+            Err(err) => warn!(
+                bundle_id = %key,
+                delivery_status = status_str,
+                "Failed to persist file delivery receipt: {err}"
+            ),
+        }
     }
 
     async fn on_deliver(
@@ -530,5 +574,76 @@ mod tests {
             entries.is_empty(),
             "payload file must be removed when DB insert fails"
         );
+    }
+
+    #[tokio::test]
+    async fn status_notify_persists_delivery_receipt_for_file_bundle() {
+        let keystore = Arc::new(DirectionalKeyStore::empty());
+        let (service, storage, _tmp) = make_files_service(keystore, None);
+
+        let src: Eid = "dtn://stata/files".parse().unwrap();
+        let dst: Eid = "dtn://statb/files".parse().unwrap();
+        let (bundle, _) = Builder::new(src, dst)
+            .with_lifetime(Duration::from_secs(3600))
+            .with_payload(b"file receipt test".to_vec().into())
+            .build(CreationTimestamp::now())
+            .unwrap();
+        let bundle_key = bundle.primary.id.to_key();
+
+        let payload_path = storage.files_dir().join("receipt.bin");
+        std::fs::write(&payload_path, b"file receipt test").unwrap();
+        let record = FileBundleRecord {
+            id: bundle_key.clone(),
+            source_eid: "dtn://stata/files".to_string(),
+            destination_eid: "dtn://statb/files".to_string(),
+            creation_timestamp: 1_700_000_000_000,
+            lifetime_secs: 3600,
+            expiry_timestamp: 1_700_003_600_000,
+            size: 17,
+            payload_path: payload_path.to_string_lossy().to_string(),
+            mime_type: "application/octet-stream".to_string(),
+            is_sticky: false,
+            is_read: true,
+            created_at: "2026-11-22T12:00:00Z".to_string(),
+            auth_status: "valid".to_string(),
+            delivery_status: None,
+            delivery_reason: None,
+            delivery_updated_at: None,
+        };
+        storage.insert_file_bundle(&record).unwrap();
+
+        let relay_from: Eid = "dtn://relay1/".parse().unwrap();
+        let ts1 = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
+        service
+            .on_status_notify(
+                &bundle.primary.id,
+                &relay_from,
+                StatusNotify::Forwarded,
+                ReasonCode::ForwardedOverUnidirectionalLink,
+                Some(ts1),
+            )
+            .await;
+
+        let mid = storage.get_file_bundle(&bundle_key).unwrap().unwrap();
+        assert_eq!(mid.delivery_status.as_deref(), Some("forwarded"));
+        assert_eq!(mid.delivery_reason, Some(2));
+        assert_eq!(mid.delivery_updated_at, Some(1_700_000_100_000));
+
+        let dest_from: Eid = "dtn://statb/".parse().unwrap();
+        let ts2 = OffsetDateTime::from_unix_timestamp(1_700_000_200).unwrap();
+        service
+            .on_status_notify(
+                &bundle.primary.id,
+                &dest_from,
+                StatusNotify::Delivered,
+                ReasonCode::NoAdditionalInformation,
+                Some(ts2),
+            )
+            .await;
+
+        let done = storage.get_file_bundle(&bundle_key).unwrap().unwrap();
+        assert_eq!(done.delivery_status.as_deref(), Some("delivered"));
+        assert_eq!(done.delivery_reason, Some(0));
+        assert_eq!(done.delivery_updated_at, Some(1_700_000_200_000));
     }
 }

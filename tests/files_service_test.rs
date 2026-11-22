@@ -272,6 +272,9 @@ async fn test_files_payload_range_requests_and_mime_detection() {
         is_sticky: false,
         is_read: false,
         auth_status: "unsigned".to_string(),
+        delivery_status: None,
+        delivery_reason: None,
+        delivery_updated_at: None,
     };
     srv.ctx
         .internal_storage
@@ -299,6 +302,9 @@ async fn test_files_payload_range_requests_and_mime_detection() {
         is_sticky: false,
         is_read: false,
         auth_status: "unsigned".to_string(),
+        delivery_status: None,
+        delivery_reason: None,
+        delivery_updated_at: None,
     };
     srv.ctx
         .internal_storage
@@ -324,6 +330,9 @@ async fn test_files_payload_range_requests_and_mime_detection() {
         is_sticky: false,
         is_read: false,
         auth_status: "unsigned".to_string(),
+        delivery_status: None,
+        delivery_reason: None,
+        delivery_updated_at: None,
     };
     srv.ctx
         .internal_storage
